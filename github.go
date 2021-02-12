@@ -1,114 +1,86 @@
 package main
 
 import (
-	"crypto/sha1"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"os"
-	"path"
-	"time"
+	"strings"
+
+	"github.com/google/go-github/v33/github"
 )
 
-// download the kernel image from the given release into a temporary location.
-// Returns the downloaded image path, its SHA1 digest and any error that may have occurred.
-func downloadReleasedImage(link string) (string, string, error) {
-	downloadedKernel := path.Join(os.TempDir(), kernelImageName)
-	client := http.Client{Timeout: 5 * time.Second}
-	r, err := client.Get(link)
+// could have wrapped the github interaction in its own struct (e.g., bound to a specific
+// owner and repository name on creation), but a global variable would do fine here...
+var gh = github.NewClient(nil)
+
+// list recent releases in repository, printing out release tag, publish date and status
+func listReleases(ctx context.Context, repository string) error {
+	owner, repo, err := ghOwnerAndRepo(repository)
 	if err != nil {
-		return "", emptySHA1, fmt.Errorf("failed to retrieve release %s: %w", link, err)
+		return err
 	}
 
-	release := GithubRelease{}
-	err = json.NewDecoder(r.Body).Decode(&release)
-	r.Body.Close()
+	releases, _, err := gh.Repositories.ListReleases(ctx, owner, repo, nil)
 	if err != nil {
-		return "", emptySHA1, fmt.Errorf("failed to parse release %s: %w", link, err)
+		return fmt.Errorf("Repositories.ListReleases returned error: %w", err)
 	}
 
-	log.Printf("Latest release in %s is %s, published %s (draft/prerelease:%t).\n",
-		*repo, release.TagName, release.PublishedAt.Format("2006-01-02"),
-		release.Draft || release.Prerelease)
-	log.Println("Description")
-	log.Println(release.Body)
+	fmt.Println("listing recent releases from", repository)
+	for _, release := range releases {
+		fmt.Printf("release %s published %v (draft/pre-release: %t)\n",
+			*release.TagName, release.PublishedAt.Format("2006-01-02"),
+			*release.Draft || *release.Prerelease)
+	}
+	return nil
+}
 
-	for i := 0; i < len(release.Assets); i++ {
-		if release.Assets[i].Name == kernelImageName {
-			if *autoTag {
-				downloadedKernel = fmt.Sprintf("%s.%s", downloadedKernel, release.TagName)
-			}
-			downloadedKernel = path.Clean(downloadedKernel)
+// get release asset by name from specified release tag
+// Caller is responsible forclosing the returned io.ReadCloser
+func getReleaseAsset(ctx context.Context, repository, tag, filename string) (io.ReadCloser, string, error) {
+	owner, repo, err := ghOwnerAndRepo(repository)
+	if err != nil {
+		return nil, "", err
+	}
 
-			err := downloadKernelImage(release.Assets[i].BrowserDownloadURL, downloadedKernel)
-			digest, err := sha1sum(downloadedKernel)
-			return downloadedKernel, digest, err
+	ghRelease := &github.RepositoryRelease{}
+	ghReleaseTag := tag
+
+	if tag == "" || tag == "latest" {
+		tag = "latest"
+		ghRelease, _, err = gh.Repositories.GetLatestRelease(ctx, owner, repo)
+	} else {
+		ghRelease, _, err = gh.Repositories.GetReleaseByTag(ctx, owner, repo, tag)
+	}
+
+	if err != nil {
+		return nil, "", err
+	}
+
+	id := int64(0)
+	if ghReleaseTag == "" {
+		ghReleaseTag = *ghRelease.TagName
+	}
+
+	for _, ra := range ghRelease.Assets {
+		if *ra.Name == filename {
+			id = *ra.ID
+			break
 		}
 	}
-	return "", emptySHA1, fmt.Errorf("unable to find asset %s in %s", kernelImageName, link)
+	if id == int64(0) {
+		return nil, "", fmt.Errorf("asset %s not found in release %s tagged %s", filename, repository, tag)
+	}
+	rc, _, err := gh.Repositories.DownloadReleaseAsset(ctx, owner, repo, id, http.DefaultClient)
+	return rc, ghReleaseTag, err
 }
 
-// download kernel image from URL to local path, returns any error
-func downloadKernelImage(assetURL, localPath string) error {
-	client := http.Client{Timeout: 5 * time.Second}
-	r, err := client.Get(assetURL)
-	if err != nil {
-		return fmt.Errorf("failed to download %s: %w", assetURL, err)
+// split the combined repository string into owner and repository name
+func ghOwnerAndRepo(repository string) (string, string, error) {
+	components := strings.Split(repository, "/")
+	if len(components) != 2 {
+		return "", "", errors.New("unexpected repository format, should be <user>/<repo>")
 	}
-	defer r.Body.Close()
-
-	out, err := os.Create(localPath)
-	_, err = io.Copy(out, r.Body)
-	out.Close()
-	if err != nil {
-		return fmt.Errorf("failed to save %s to %s: %w", assetURL, localPath, err)
-	}
-	return nil
-}
-
-// return the SHA1 digest for the named file
-func sha1sum(fn string) (string, error) {
-	if _, err := os.Stat(fn); err != nil {
-		return emptySHA1, fmt.Errorf("failed to stat %s: %w", fn, err)
-	}
-
-	file, err := os.Open(fn)
-	if err != nil {
-		return emptySHA1, fmt.Errorf("failed to open %s: %w", fn, err)
-	}
-	defer file.Close()
-
-	h := sha1.New()
-	_, err = io.Copy(h, file)
-	if err != nil {
-		return emptySHA1, fmt.Errorf("failed to checksum %s: %w", fn, err)
-	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
-// list recent releases and their status
-func listRecentReleases() error {
-	releases := ghReposEndpoint + *repo + "/releases"
-	client := http.Client{Timeout: 5 * time.Second}
-	r, err := client.Get(releases)
-
-	if err != nil {
-		return err
-	}
-
-	recent := GithubReleaseList{}
-	err = json.NewDecoder(r.Body).Decode(&recent)
-	r.Body.Close()
-	if err != nil {
-		return err
-	}
-	log.Println("listing releases from", *repo)
-	for i := 0; i < len(recent); i++ {
-		log.Printf("release %s published %v (draft/pre-release:%t)",
-			recent[i].TagName, recent[i].PublishedAt.Format("2006-01-02"),
-			recent[i].Draft || recent[i].Prerelease)
-	}
-	return nil
+	return components[0], components[1], nil
 }
